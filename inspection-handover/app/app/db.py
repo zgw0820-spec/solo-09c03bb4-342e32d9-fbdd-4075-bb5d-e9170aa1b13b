@@ -25,27 +25,97 @@ def ping(dsn: str) -> bool:
         return False
 
 
-def insert_work_order(dsn: str, title: str, detail: str, source_db: str) -> dict[str, Any]:
-    """在指定库写入工单，编号由该库序列 nextval 生成并随事务一起提交。"""
-    with connect(dsn) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+# priority 列定义（可空 + 0~3 约束）。逻辑复制不同步 DDL，由应用按
+# “先订阅端、后发布端”的顺序在两库分别执行，见 rollout.py。
+PRIORITY_COLUMN = "priority"
+PRIORITY_CHECK_NAME = "work_orders_priority_check"
+
+
+def column_exists(dsn: str, table: str, column: str) -> bool:
+    with connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO work_orders (title, detail, source_db)
-            VALUES (%s, %s, %s)
-            RETURNING id, title, detail, source_db, created_at
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = %s AND column_name = %s
             """,
-            (title, detail, source_db),
+            (table, column),
         )
-        row = cur.fetchone()
+        return cur.fetchone() is not None
+
+
+def add_priority_column(dsn: str) -> None:
+    """幂等地给 work_orders 增加可空 priority(smallint, 0~3)。
+
+    列与约束分两步、均带 IF NOT EXISTS/存在性判断：重复执行、进程重启后
+    重入都安全。可空列不重写表、不影响复制中的旧写法 INSERT。
+    """
+    with connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS priority smallint"
+        )
+        cur.execute(
+            "SELECT 1 FROM pg_constraint WHERE conname = %s",
+            (PRIORITY_CHECK_NAME,),
+        )
+        if cur.fetchone() is None:
+            cur.execute(
+                f"ALTER TABLE work_orders ADD CONSTRAINT {PRIORITY_CHECK_NAME} "
+                "CHECK (priority IS NULL OR priority BETWEEN 0 AND 3)"
+            )
         conn.commit()
-        return dict(row)
+
+
+def insert_work_order(
+    dsn: str,
+    title: str,
+    detail: str,
+    source_db: str,
+    priority: int | None = None,
+) -> dict[str, Any]:
+    """在指定库写入工单，编号由该库序列 nextval 生成并随事务一起提交。
+
+    priority 仅在该库已具备 priority 列且调用方给出非空值时才写入；
+    字段发布完成前、或调用方不传 priority 时，语句与旧写法完全一致，
+    因此发布过程中两个库任意阶段都能正常受理工单。
+    """
+    include_priority = (
+        priority is not None and column_exists(dsn, "work_orders", PRIORITY_COLUMN)
+    )
+    columns = ["title", "detail", "source_db"]
+    params: list[Any] = [title, detail, source_db]
+    returning = ["id", "title", "detail", "source_db", "created_at"]
+    if include_priority:
+        columns.append(PRIORITY_COLUMN)
+        params.append(priority)
+        returning.append(PRIORITY_COLUMN)
+    placeholders = ", ".join(["%s"] * len(params))
+    with connect(dsn) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            INSERT INTO work_orders ({", ".join(columns)})
+            VALUES ({placeholders})
+            RETURNING {", ".join(returning)}
+            """,
+            params,
+        )
+        row = dict(cur.fetchone())
+        conn.commit()
+        # 响应结构保持稳定：列尚不存在或未传值时显式补 None
+        row.setdefault(PRIORITY_COLUMN, None)
+        return row
 
 
 def list_work_orders(dsn: str, limit: int = 100) -> list[dict[str, Any]]:
+    # 列未发布前用 NULL 占位，保证两库任意阶段响应结构一致
+    if column_exists(dsn, "work_orders", PRIORITY_COLUMN):
+        priority_select = PRIORITY_COLUMN
+    else:
+        priority_select = f"NULL::smallint AS {PRIORITY_COLUMN}"
     with connect(dsn) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            """
-            SELECT id, title, detail, source_db, created_at
+            f"""
+            SELECT id, title, detail, source_db, created_at, {priority_select}
             FROM work_orders
             ORDER BY id DESC
             LIMIT %s

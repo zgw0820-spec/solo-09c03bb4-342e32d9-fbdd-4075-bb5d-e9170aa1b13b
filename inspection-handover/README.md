@@ -10,17 +10,19 @@ FastAPI + 双 PostgreSQL 15（逻辑复制）实现的工单库单向交接：�
 ├── docker-compose.yml            # old-db / new-db / app 三服务
 ├── app/                          # FastAPI 应用（含 Dockerfile、requirements）
 │   └── app/
-│       ├── main.py               # 路由与演示网页（工单、交接、订阅暂停/恢复、日志）
+│       ├── main.py               # 路由与演示网页（工单、交接、priority 字段发布、订阅暂停/恢复、日志）
 │       ├── cutover.py            # 交接状态机：OLD -> SWITCHING -> NEW，失败/超时回滚
-│       ├── state.py              # 接单库状态持久化（SQLite，重启沿用）
-│       ├── db.py                 # PG 访问：工单写入、序列快照、复制状态查询
+│       ├── rollout.py            # priority 字段一次性发布状态机：先订阅端后发布端，幂等可重试
+│       ├── state.py              # 接单库与发布阶段持久化（SQLite，重启沿用）
+│       ├── db.py                 # PG 访问：工单写入（动态适配 priority 列）、幂等加列、复制状态查询
 │       └── config.py             # 环境变量配置
 ├── db/old/init/01_schema.sql     # 旧库：表 + CACHE 5 序列 + 发布
 ├── db/new/init/                  # 新库：同名表/序列 + 订阅创建脚本
 ├── scripts/
 │   ├── local_pg.sh               # 无 Docker 时用本地 PG 二进制起两库并配置复制
 │   └── local_app.sh              # 无 Docker 时本地启动应用
-└── tests/e2e_test.py             # 端到端试跑（27 项断言）
+├── tests/e2e_test.py             # 交接端到端试跑（29 项断言）
+└── tests/priority_rollout_test.py # priority 字段发布端到端试跑（45 项断言，含暂停/重试/重启）
 ```
 
 ## 方式一：Docker Compose（交付目标）
@@ -41,7 +43,8 @@ docker compose up --build
 ```bash
 ./scripts/local_pg.sh start      # 初始化并启动两库 + 逻辑复制（55433 旧 / 55434 新）
 ./scripts/local_app.sh           # 启动 FastAPI（http://127.0.0.1:8000，超时阈值 8s）
-python -I tests/e2e_test.py      # 端到端试跑
+python -I tests/e2e_test.py             # 交接端到端试跑
+python -I tests/priority_rollout_test.py # priority 字段发布端到端试跑（脚本自行启停应用）
 ./scripts/local_pg.sh status     # 查看两库行数与订阅状态
 ./scripts/local_pg.sh stop       # 停止；clean 可清理全部本地数据
 ```
@@ -70,7 +73,43 @@ python -I tests/e2e_test.py      # 端到端试跑
 9. **订阅暂停/恢复**：网页按钮执行 `ALTER SUBSCRIPTION DISABLE/ENABLE`。
    暂停期间旧库继续写入可制造复制积压，发起交接即可演示追平超时与自动回滚。
 
-## 已验证结果（tests/e2e_test.py，29/29 通过）
+## priority(0~3) 字段一次性发布（逻辑复制不同步 DDL）
+
+逻辑复制只传播表数据（DML），`ALTER TABLE ... ADD COLUMN` 这类 DDL 不会到
+订阅端。网页“开始/重试字段发布”按钮（`POST /api/priority-rollout`）按严格
+顺序在两库分别执行，阶段机只进不退、逐步落 SQLite：
+
+```
+NOT_STARTED
+  -> NEW_COLUMN_ADDED            # 1. 订阅端（新库）先加可空 priority smallint + CHECK(0~3)
+  -> CAUGHT_UP_AFTER_NEW         # 2. 等复制追平（replay_lsn = current_lsn 且 streaming）
+  -> PUBLISHER_COLUMN_ADDED      # 3. 发布端（旧库）后加同名列与同名 CHECK 约束
+  -> CAUGHT_UP_AFTER_PUBLISHER   # 4. 再次等追平，确认两库结构/数据位置一致
+  -> COMPLETED                   # 5. 网页才开放优先级下拉框，新值写入当前接单库
+```
+
+1. **为什么先订阅端后发布端**：若发布端先加列而订阅端没有同名列，后续复制
+   过来的行会在订阅端 apply 失败并中断订阅；订阅端先具备同名列后，发布端
+   再加列，全程复制的 INSERT 都不含 priority（可空列默认 NULL），不会出错。
+2. **旧写法全程可用**：列可空且 `db.insert_work_order` 仅在“该库已有列且
+   调用方传了非空 priority”时才写该列；发布前、发布中、失败后不带 priority
+   的提交在两个库任意阶段都成功。发布未完成时接口对带 priority 的提交返回
+   409，网页下拉框保持禁用。
+3. **失败保持旧模式并可重试**：任一步异常或等追平超时（与交接共用
+   `CUTOVER_TIMEOUT_SECONDS`）都不改变接单库；响应与状态接口返回
+   `unfinished_dbs`（缺列的库）与 `last_error`（阶段、原因、时间），事件日志
+   同步记录。再次点击从持久化阶段续跑，已生效步骤跳过。
+4. **幂等与重启沿用**：加列用 `ADD COLUMN IF NOT EXISTS`，CHECK 约束先查
+   `pg_constraint` 再建；阶段只允许向前推进。即使出现“DDL 已生效但阶段尚未
+   落盘”的崩溃，重试时 DDL 被跳过、阶段对账后继续。应用重启后从 SQLite
+   恢复阶段；完成后重复点击只回显 `already_done`，不重复执行。
+5. **发布后写入语义**：priority 取值 0~3（Pydantic 层 422 + 数据库 CHECK
+   约束双重拦截），随工单写入当前接单库；旧库接单期间的新值经逻辑复制同步
+   到新库。两库列表接口始终返回 priority 字段（列不存在时以 NULL 占位）。
+
+## 已验证结果
+
+### 交接试跑（tests/e2e_test.py，29/29 通过）
 
 - 旧库受理工单并自动编号；逻辑复制实时同步到新库；
 - 制造回滚空号与缓存未用号后，实际最大发号 < 序列预留最高号，交接计算的
@@ -78,6 +117,20 @@ python -I tests/e2e_test.py      # 端到端试跑
 - 暂停订阅 → 交接在 8s 超时 → 504 并自动回滚 OLD，旧库恢复接单；
 - 恢复订阅追平后，在途慢事务结束才完成交接；
 - 新库序列对齐、新库接单编号接续；重复交接幂等；应用重启后仍为 NEW。
+
+### priority 字段发布试跑（tests/priority_rollout_test.py，45/45 通过）
+
+- 发布前两库均无列：带 priority 的提交 409，旧写法（含显式 null）正常受理；
+- 暂停订阅 → 发布在“新库加列后等追平”处 8s 超时 → 504，仅新库有列、旧库
+  无列，响应与日志记录未完成的库（old）与原因，旧模式工单继续写入；
+- 部分完成状态下杀掉应用再启动：阶段仍为 NEW_COLUMN_ADDED，不回退、不重复加列；
+- 恢复订阅后重试：幂等续跑至 COMPLETED，两库列为可空 smallint 且带
+  CHECK(0~3)；另用直连 SQL 验证“发布端 DDL 已生效但阶段落后”的崩溃对账；
+- 完成后重复点击回显 already_done；priority=3 写入旧库并复制到新库；
+  API 层 422 与数据库 CHECK 双重拒绝越界值；
+- 再次重启仍为 COMPLETED；交接切换后 priority=0/2 写入当前接单库（新库），
+  单向复制拓扑下不回灌旧库；两库列表均返回 priority 字段；
+- 事件日志覆盖两库加列、两次追平、失败与完成全过程。
 
 ## 已知边界/剩余事项
 
